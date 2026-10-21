@@ -9139,7 +9139,7 @@ window.VoltechOps=(function(){
   let alertQueue=null, deviceKey=null;
   const serverVer={};            // branchId -> آخر نسخة معروفة من حالة الفرع
   let centralVer=0, centralHash='', identityHash='', lastRateSeen=null;
-  const catCache={}, accCache={}, lastPushed={}, pendingImport={};
+  const catCache={}, accCache={}, lastPushed={}, pendingImport={}, baseStr={}; let syncing=false, needFin=false, finAt=0;
   window.__vtOverlayDiffs=[];
 
   const norm=s=>String(s==null?'':s).trim().toLowerCase();
@@ -9334,21 +9334,32 @@ window.VoltechOps=(function(){
   async function pullFinancials(branch){
     const b=Number(branch)||curBranch();
     if(pendingImport[b]) return;   // بيانات محلية قديمة بانتظار الاستيراد: لا نكتب فوقها أرصدة فارغة
-    const [t,a]=await Promise.all([
+    const [t,a,st,ct]=await Promise.all([
       rest('branch_treasury?branch_id=eq.'+b+'&select=cashier_balance,vault_balance'),
-      rest('accounts?branch_id=eq.'+b+'&select=id,code,name,entity_type,linked_branch_id,total,paid,payable_total,payable_paid,payable_usd,payable_paid_usd,operational_balance,branch_balance&order=id.asc')
+      rest('accounts?branch_id=eq.'+b+'&select=id,code,name,entity_type,linked_branch_id,total,paid,payable_total,payable_paid,payable_usd,payable_paid_usd,operational_balance,branch_balance&order=id.asc'),
+      rest('accessory_stock?branch_id=eq.'+b+'&select=catalog_id,qty'),
+      rest('accessory_catalog?select=id,data')
     ]);
     if(!t.ok||!a.ok) throw new Error('تعذر قراءة الأرصدة من السيرفر.');
+    // كميات الإكسسوار: المرجع جدول المخزون بالسيرفر (حتى لا تتضارب كميات الكاشيرات)
+    const applyAccQty=list=>{
+      try{
+        if(!st.ok||!ct.ok||!Array.isArray(list)) return;
+        const bc=new Map((ct.data||[]).map(c=>[Number(c.id),String((c.data&&c.data.barcode)||'').trim()]));
+        const q=new Map(); (st.data||[]).forEach(r=>{ const k=bc.get(Number(r.catalog_id)); if(k) q.set(k,(q.get(k)||0)+(Number(r.qty)||0)); });
+        list.forEach(x=>{ const k=String(x&&x.barcode||'').trim(); if(k&&q.has(k)) x.qty=q.get(k); });
+      }catch(_){}
+    };
     const tr=(t.data||[])[0]||{cashier_balance:0,vault_balance:0};
     if(b===curBranch()){
       cashierBalance=Number(tr.cashier_balance)||0; vaultBalance=Number(tr.vault_balance)||0;
-      mapAccounts(accountsList,a.data||[]);
+      mapAccounts(accountsList,a.data||[]); applyAccQty(warehouseAccessoriesList);
       try{ ensureSinglePosAccount(); ensureInstallmentAccount(); }catch(_){}
       syncActiveBranchToStore();
     }else{
       const d=ensureBranchData(b);
       d.cashierBalance=Number(tr.cashier_balance)||0; d.vaultBalance=Number(tr.vault_balance)||0;
-      mapAccounts(d.accountsList=Array.isArray(d.accountsList)?d.accountsList:fixedSystemAccountsFactory(),a.data||[]);
+      mapAccounts(d.accountsList=Array.isArray(d.accountsList)?d.accountsList:fixedSystemAccountsFactory(),a.data||[]); applyAccQty(d.warehouseAccessoriesList);
     }
   }
 
@@ -9398,56 +9409,151 @@ window.VoltechOps=(function(){
     if(!r.ok) throw new Error(errMsg(r));
     const v=Number(r.data&&r.data.version)||0, doc=r.data&&r.data.data;
     serverVer[b]=v;
-    if(doc&&typeof doc==='object'&&Object.keys(doc).length){ branchDataStore[b]=doc; ensureBranchData(b); delete lastPushed[b]; return true; }
+    if(doc&&typeof doc==='object'&&Object.keys(doc).length){ baseStr[b]=JSON.stringify(doc); branchDataStore[b]=doc; ensureBranchData(b); delete lastPushed[b]; return true; }
     return false;
   }
 
-  /* ---------- القفل ---------- */
+
+  /* ---------- دمج تعدد الكاشير (3-way merge) ---------- */
+  const DELTA_FIELDS={qty:1};
+  const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+  const clone=o=>o==null?o:JSON.parse(JSON.stringify(o));
+  function itemKey(k,it){
+    if(!it||typeof it!=='object') return null;
+    if(k==='warehouseDevicesList') return it.imei!=null&&it.imei!==''?'m'+it.imei:null;
+    if(k==='warehouseAccessoriesList') return it.barcode!=null&&it.barcode!==''?'b'+it.barcode:(it.id!=null?'i'+it.id:null);
+    if(k==='accountsList') return it.dbId!=null?'d'+it.dbId:(it.name!=null?'n'+it.name:null);
+    if(it.dbId!=null) return 'd'+it.dbId;
+    if((k==='deviceInvoicesArchive'||k==='accessoryInvoicesArchive')&&it.invoiceNo!=null) return 'v'+it.invoiceNo;
+    if(it.id!=null) return 'i'+it.id;
+    return null;
+  }
+  function mergeObj(base,ours,theirs){      // كائن عادي: حقل بحقل
+    base=base&&typeof base==='object'&&!Array.isArray(base)?base:{};
+    ours=ours&&typeof ours==='object'?ours:{}; theirs=theirs&&typeof theirs==='object'?theirs:{};
+    const out={}, keys=new Set([...Object.keys(base),...Object.keys(ours),...Object.keys(theirs)]);
+    keys.forEach(k=>{ const v=mergeVal(k,base[k],ours[k],theirs[k]); if(v!==undefined) out[k]=v; });
+    return out;
+  }
+  function mergeArr(k,base,ours,theirs){
+    base=Array.isArray(base)?base:[]; ours=Array.isArray(ours)?ours:[]; theirs=Array.isArray(theirs)?theirs:[];
+    const all=[...base,...ours,...theirs];
+    if(all.some(x=>itemKey(k,x)==null)){ return same(ours,base)?theirs:ours; }   // عناصر بلا مفتاح: الأحدث محلياً إن تغيّر
+    const bm=new Map(base.map(x=>[itemKey(k,x),x])), om=new Map(ours.map(x=>[itemKey(k,x),x])), tm=new Map(theirs.map(x=>[itemKey(k,x),x]));
+    const out=[], seen=new Set();
+    const put=(key,val)=>{ if(val!==undefined&&!seen.has(key)){ seen.add(key); out.push(val); } };
+    // ترتيب: ترتيب theirs أولاً (المرجع) ثم عناصرنا الجديدة بمواقعها (في المقدمة إن كانت إضافات جديدة بالمقدمة)
+    const newOurs=ours.filter(x=>!tm.has(itemKey(k,x))&&!bm.has(itemKey(k,x)));
+    const lead=ours.length&&newOurs.length&&itemKey(k,ours[0])===itemKey(k,newOurs[0]);
+    if(lead) newOurs.forEach(x=>put(itemKey(k,x),x));
+    theirs.forEach(t=>{
+      const key=itemKey(k,t), b=bm.get(key), o=om.get(key);
+      if(bm.has(key)&&!om.has(key)){ if(same(t,b)) return; put(key,t); return; }   // حذفناه محلياً: يُحذف إذا ما تغيّر عندهم
+      if(!om.has(key)){ put(key,t); return; }                                     // عنصر جديد من غيرنا
+      if(!bm.has(key)){ put(key,same(o,t)?t:mergeObj({},o,t)); return; }          // أضفناه معاً
+      put(key,mergeVal(null,b,o,t));
+    });
+    base.forEach(b=>{ const key=itemKey(k,b); if(!tm.has(key)&&om.has(key)&&!same(om.get(key),b)) put(key,om.get(key)); });  // حذفوه لكن عدّلناه
+    newOurs.forEach(x=>put(itemKey(k,x),x));
+    ours.forEach(x=>{ const key=itemKey(k,x); if(!seen.has(key)&&!bm.has(key)) put(key,x); });
+    return out;
+  }
+  function mergeVal(k,base,ours,theirs){
+    if(same(ours,theirs)) return ours;
+    if(same(ours,base)) return theirs;       // ما غيّرنا شي: خذ نسخة السيرفر
+    if(same(theirs,base)) return ours;       // هم ما غيّروا: نسختنا
+    if(typeof k==='string'&&/Counter$/.test(k)&&typeof ours==='number'&&typeof theirs==='number') return Math.max(ours,theirs);
+    if(k==='cashierBalance'||k==='vaultBalance') return theirs;     // الأرصدة مرجعها السيرفر (تُطبَّق من branch_treasury)
+    if(typeof k==='string'&&DELTA_FIELDS[k]&&typeof ours==='number'&&typeof theirs==='number'&&typeof base==='number') return Math.max(0,theirs+(ours-base));
+    if(Array.isArray(ours)||Array.isArray(theirs)) return mergeArr(k,base,ours,theirs);
+    if(ours&&theirs&&typeof ours==='object'&&typeof theirs==='object') return mergeObj(base,ours,theirs);
+    return ours;
+  }
+  function mergeDocs(base,ours,theirs){ return mergeObj(base,ours,theirs); }
+
+  // حفظ/استرجاع قيم الحقول حتى لا يمسح التحديث التلقائي ما يكتبه الكاشير
+  function captureForms(){
+    const m=[]; try{ document.querySelectorAll('input[id],select[id],textarea[id]').forEach(e=>{ if(e.type==='file') return; m.push([e.id,e.type==='checkbox'||e.type==='radio'?e.checked:e.value]); }); }catch(_){}
+    return m;
+  }
+  function restoreForms(m){
+    try{ m.forEach(([id,v])=>{ const e=document.getElementById(id); if(!e) return;
+      if(e.type==='checkbox'||e.type==='radio'){ if(e.checked!==v) e.checked=v; }
+      else if(e.value!==v){ if(e.tagName==='SELECT'&&![...e.options].some(o=>o.value===v)) return; e.value=v; } }); }catch(_){}
+  }
+  // يجلب حالة الفرع إذا تغيّرت على السيرفر ويدمجها مع شغلنا المحلي غير المرفوع
+  async function syncFromServer(opts){
+    opts=opts||{};
+    if(!active()||syncing) return false;
+    const b=curBranch();
+    syncing=true;
+    try{
+      if(!opts.force){
+        const vr=await call('get_branch_version',{p_branch:b});
+        if(!vr.ok) return false;
+        if(Number(vr.data)<=(serverVer[b]||0)) return false;
+      }
+      const r=await call('get_branch_state',{p_branch:b});
+      if(!r.ok) return false;
+      const v=Number(r.data&&r.data.version)||0, theirs=r.data&&r.data.data;
+      if(!theirs||typeof theirs!=='object'||v<=(serverVer[b]||0)) return false;
+      syncActiveBranchToStore();
+      const ours=branchDataStore[b], base=baseStr[b]?JSON.parse(baseStr[b]):{};
+      const merged=mergeDocs(base,ours,theirs);
+      branchDataStore[b]=merged; ensureBranchData(b);
+      serverVer[b]=v; baseStr[b]=JSON.stringify(theirs); lastPushed[b]=baseStr[b];
+      const keep=captureForms();
+      loadBranchData(b);
+      try{ await pullFinancials(b); needFin=false; }catch(e){ needFin=true; }
+      refreshAllViews();
+      restoreForms(keep);
+      if(JSON.stringify(branchDataStore[b])!==baseStr[b]) schedulePush();
+      return true;
+    }catch(e){ console.warn('VOLTECH sync',e); return false; }
+    finally{ syncing=false; }
+  }
+
+  /* ---------- القفل (لم يعد مستخدماً: متعدد الكاشير) ---------- */
   async function acquire(b){
-    const r=await call('acquire_branch_lock',{p_branch:b,p_device:devId()});
-    return !!(r.ok&&r.data&&r.data.ok);
+    return true;
   }
-  function setReadOnly(on,msg){
-    if(on===readOnly&&!msg) return;
-    readOnly=on; roBanner(on?(msg||RO_MSG):'');
-  }
+  function setReadOnly(){ readOnly=false; roBanner(''); }   // متعدد الكاشير: لا وضع عرض فقط
   async function heartbeat(){
     if(!active()) return;
-    const b=curBranch();
     try{
-      const ok=await acquire(b);
-      if(ok&&readOnly){
-        // صرنا الكاتب: نجلب آخر حالة قبل السماح بالتعديل
-        if(await pullBranchState(b)){ loadBranchData(b); await pullFinancials(b); refreshAllViews(); }
-        setReadOnly(false);
-      }else if(!ok&&!readOnly){ setReadOnly(true); }
       await pullSettings().then(()=>{ try{ updateExchangeRateUI(); }catch(_){} });
       await pullCentral(true);
-      if(readOnly){
-        const before=serverVer[b]||0;
-        const r=await call('get_branch_state',{p_branch:b});
-        if(r.ok&&Number(r.data.version)>before&&r.data.data){ serverVer[b]=Number(r.data.version); branchDataStore[b]=r.data.data; loadBranchData(b); await pullFinancials(b); refreshAllViews(); }
-      }
     }catch(e){ console.warn('VOLTECH heartbeat',e); }
+  }
+  // استعلام خفيف كل بضع ثوانٍ: إذا غيّر كاشير/محاسب آخر الفرع نحدّث شاشتنا بدون مسح شغلنا
+  async function pollTick(){
+    if(!active()||busy||depth||syncing) return;
+    try{ if(document.hidden) return; }catch(_){}
+    try{ const ae=document.activeElement; if(ae&&/^(INPUT|SELECT|TEXTAREA)$/.test(ae.tagName)&&ae.type!=='button'&&ae.type!=='checkbox'&&ae.type!=='radio'&&ae.type!=='submit') return; }catch(_){}
+    const did=await syncFromServer();
+    if(!did&&(needFin||Date.now()-finAt>20000)){ finAt=Date.now(); try{ await pullFinancials(curBranch()); needFin=false; refreshAllViews(); }catch(_){ needFin=true; } }
   }
 
   /* ---------- رفع الحالة ---------- */
-  function schedulePush(){ if(!active()||readOnly||pushTimer) return; pushTimer=setTimeout(()=>{ pushTimer=null; pushNow(); },2500); }
+  function schedulePush(){ if(!active()||pushTimer) return; pushTimer=setTimeout(()=>{ pushTimer=null; pushNow(); },2500); }
   async function pushNow(){
-    if(!active()||readOnly) return;
-    if(busy||depth){ schedulePush(); return; }
+    if(!active()) return;
+    if(busy||depth||syncing){ schedulePush(); return; }
     try{
       syncActiveBranchToStore();
       const b=curBranch(), doc=branchDataStore[b];
       const str=JSON.stringify(doc);
       if(lastPushed[b]!==str){
-      const r=await call('save_branch_state',{p_branch:b,p_device:devId(),p_expected_version:serverVer[b]||0,p_data:doc});
-      if(r.ok){ serverVer[b]=Number(r.data.version); lastPushed[b]=str; }
-      else{
+      let r=null;
+      for(let attempt=0;attempt<6;attempt++){
+        syncActiveBranchToStore();
+        const cur=branchDataStore[b], cs=JSON.stringify(cur);
+        if(cs===lastPushed[b]) break;
+        r=await call('save_branch_state',{p_branch:b,p_device:devId(),p_expected_version:serverVer[b]||0,p_data:cur});
+        if(r.ok){ serverVer[b]=Number(r.data.version); lastPushed[b]=cs; baseStr[b]=cs; break; }
         const m=(r.data&&r.data.message)||'';
-        if(/LOCK_LOST/.test(m)) setReadOnly(true);
-        else if(/VERSION_CONFLICT/.test(m)){ setReadOnly(true,'تغيّرت بيانات الفرع من جهاز آخر. أعد تحميل الصفحة قبل المتابعة.'); }
-        else console.warn('VOLTECH push failed',m);
+        if(/VERSION_CONFLICT/.test(m)){ await syncFromServer({force:true}); await sleep(120+Math.random()*300); continue; }
+        console.warn('VOLTECH push failed',m); break;
       }
       }
       if(canEditCentral()){
@@ -9503,14 +9609,12 @@ window.VoltechOps=(function(){
     started=true;
     for(const b of ids){ try{ await pullFinancials(b); }catch(e){ console.warn(e); } }
     if(pendingImportBranches().length){ setTimeout(()=>{ try{ _vtAlert('تنبيه للمنشأ: السيرفر فارغ وعلى هذا الجهاز بيانات قديمة. استوردها من «قاعدة البيانات السحابية ← استيراد البيانات القديمة» قبل بدء العمل، وإلا ستُرفض العمليات على المخزون القديم.'); }catch(_){} },600); }
-    const got=await acquire(curBranch());
-    if(!got) setReadOnly(true);
     clearInterval(hbTimer); hbTimer=setInterval(heartbeat,30000);
-    window.addEventListener('beforeunload',()=>{ try{ const c=JSON.parse(sessionStorage.getItem('vt_cloud_session')||'null'); if(c&&!readOnly){ const cfg=loadCloudConfig(); fetch(cfg.url+'/rest/v1/rpc/release_branch_lock',{method:'POST',keepalive:true,headers:{apikey:cfg.anonKey,Authorization:'Bearer '+c.access_token,'Content-Type':'application/json'},body:JSON.stringify({p_branch:curBranch(),p_device:devId()})}); } }catch(_){} });
+    clearInterval(pollTimer); pollTimer=setInterval(pollTick,5000);
   }
   async function stop(){
-    started=false; clearInterval(hbTimer); clearTimeout(pushTimer);
-    try{ if(!readOnly) await call('release_branch_lock',{p_branch:curBranch(),p_device:devId()}); }catch(_){}
+    started=false; clearInterval(hbTimer); clearInterval(pollTimer); clearTimeout(pushTimer);
+    try{ if(depth===0&&!busy) await pushNow(); }catch(_){}
   }
 
   /* ---------- أدوات المحاسبة المحلية ---------- */
